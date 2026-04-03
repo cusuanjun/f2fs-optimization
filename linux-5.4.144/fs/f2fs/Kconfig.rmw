@@ -1,0 +1,22 @@
+config F2FS_UNALIGNED_WRITE_OFFLOAD
+	bool "F2FS unaligned write offload to FEMU"
+	depends on F2FS_FS
+	default n
+	help
+	  Enable offloading of non-page-aligned write RMW operations
+	  to FEMU for improved performance. This feature allows F2FS
+	  to send arbitrary-length writes to FEMU, which handles the
+	  read-modify-write operation internally.
+
+	  If unsure, say N.
+
+config F2FS_RMW_DEBUG
+	bool "F2FS RMW debug logging"
+	depends on F2FS_UNALIGNED_WRITE_OFFLOAD
+	default n
+	help
+	  Enable debug logging for RMW offload operations.
+	  This will print detailed information about each
+	  non-aligned write operation.
+
+	  If unsure, say N.

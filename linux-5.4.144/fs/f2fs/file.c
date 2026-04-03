@@ -29,6 +29,7 @@
 #include "acl.h"
 #include "gc.h"
 #include "trace.h"
+#include <linux/nvme_pw.h>
 #include <trace/events/f2fs.h>
 
 static vm_fault_t f2fs_filemap_fault(struct vm_fault *vmf)
@@ -3396,6 +3397,39 @@ out_err:
 			goto out;
 		}
 write:
+		/*
+		 * Partial write offload: if the write is not block-aligned,
+		 * offload the RMW to FEMU via NVMe vendor command 0xC1.
+		 * This handles any offset/length combination without O_DIRECT.
+		 */
+		if (iov_iter_rw(from) == WRITE) {
+			loff_t pos = iocb->ki_pos;
+			size_t count = iov_iter_count(from);
+			bool unaligned_off = (pos & (F2FS_BLKSIZE - 1)) != 0;
+			bool unaligned_len = (count & (F2FS_BLKSIZE - 1)) != 0;
+
+			if ((unaligned_off || unaligned_len) &&
+			    !f2fs_has_inline_data(inode) &&
+			    !(iocb->ki_flags & IOCB_DIRECT)) {
+				ssize_t pw_ret;
+				pw_ret = f2fs_partial_write_offload(inode, from, pos);
+				if (pw_ret != 0) {
+					/* pw_ret > 0: success, pw_ret < 0: error */
+					clear_inode_flag(inode, FI_NO_PREALLOC);
+					if (preallocated &&
+					    i_size_read(inode) < target_size)
+						f2fs_truncate(inode);
+					if (pw_ret > 0)
+						f2fs_update_iostat(F2FS_I_SB(inode),
+								   APP_WRITE_IO,
+								   pw_ret);
+					inode_unlock(inode);
+					ret = pw_ret;
+					goto out;
+				}
+				/* pw_ret == 0: block not allocated, fall through */
+			}
+		}
 		ret = __generic_file_write_iter(iocb, from);
 		clear_inode_flag(inode, FI_NO_PREALLOC);
 

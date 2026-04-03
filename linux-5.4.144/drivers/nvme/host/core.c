@@ -721,6 +721,14 @@ static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
 	cmnd->rw.slba = cpu_to_le64(nvme_sect_to_lba(ns, blk_rq_pos(req)));
 	cmnd->rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
 
+	/* Check if this is an offload RMW request */
+	if (req->cmd_flags & 0x40000000) { /* REQ_OFFLOAD_RMW */
+		cmnd->rw.opcode = 0xC2; /* NVME_CMD_UNALIGNED_WRITE */
+		pr_info("[NVME-RMW] setup_rw offload opcode=0xC2 slba=%llu len=%u\n",
+			(unsigned long long)le64_to_cpu(cmnd->rw.slba),
+			le16_to_cpu(cmnd->rw.length));
+	}
+
 	if (req_op(req) == REQ_OP_WRITE && ctrl->nr_streams)
 		nvme_assign_write_stream(ctrl, req, &control, &dsmgmt);
 
@@ -4279,6 +4287,77 @@ EXPORT_SYMBOL_GPL(nvme_sync_queues);
 /*
  * Check we didn't inadvertently grow the command structure sizes:
  */
+/*
+ * nvme_submit_partial_write - submit a vendor-specific partial write (opcode 0xC1)
+ * to an NVMe namespace.  The device (FEMU) performs RMW internally.
+ *
+ * @bdev:        block device of the NVMe namespace
+ * @byte_offset: byte offset within the namespace (need not be sector-aligned)
+ * @buf:         kernel virtual address of data to write
+ * @byte_len:    number of bytes to write (need not be sector-aligned)
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+int nvme_submit_partial_write(struct block_device *bdev, u64 byte_offset,
+			      const void *buf, u32 byte_len)
+{
+	struct request_queue *q;
+	struct nvme_ns *ns;
+	struct nvme_command cmd = {};
+	void *bounce;
+	int ret;
+
+	if (!bdev || !buf || byte_len == 0)
+		return -EINVAL;
+
+	ns = bdev->bd_disk->private_data;
+	if (!ns) {
+		pr_err("[NVME-PW] no nvme_ns for bdev\n");
+		return -ENODEV;
+	}
+	q = bdev_get_queue(bdev);
+	if (!q) {
+		pr_err("[NVME-PW] no request queue for bdev\n");
+		return -ENODEV;
+	}
+
+	/* Allocate a bounce buffer for the payload */
+	bounce = kmalloc(byte_len, GFP_KERNEL);
+	if (!bounce)
+		return -ENOMEM;
+	memcpy(bounce, buf, byte_len);
+
+	/*
+	 * Vendor command 0xC1: Partial Write
+	 *   nsid  = namespace id
+	 *   cdw10 = low 32 bits of byte offset
+	 *   cdw11 = high 32 bits of byte offset
+	 *   cdw12 = byte length
+	 */
+	cmd.common.opcode   = nvme_cmd_write_partial;
+	cmd.common.nsid     = cpu_to_le32(ns->head->ns_id);
+	cmd.common.cdw10    = cpu_to_le32((u32)(byte_offset & 0xFFFFFFFFULL));
+	cmd.common.cdw11    = cpu_to_le32((u32)(byte_offset >> 32));
+	cmd.common.cdw12    = cpu_to_le32(byte_len);
+
+	pr_info("[NVME-PW] submit_partial_write nsid=%u off=%llu len=%u\n",
+		ns->head->ns_id, byte_offset, byte_len);
+
+	/* Use NVME_QID_ANY (-1) to pick an I/O queue */
+	ret = __nvme_submit_sync_cmd(q, &cmd, NULL, bounce, byte_len,
+				     NVME_IO_TIMEOUT, NVME_QID_ANY, 0,
+				     0, false);
+	if (ret)
+		pr_err("[NVME-PW] partial write failed: %d\n", ret);
+	else
+		pr_info("[NVME-PW] partial write succeeded off=%llu len=%u\n",
+			byte_offset, byte_len);
+
+	kfree(bounce);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(nvme_submit_partial_write);
+
 static inline void _nvme_check_size(void)
 {
 	BUILD_BUG_ON(sizeof(struct nvme_common_command) != 64);
@@ -4364,7 +4443,9 @@ static void __exit nvme_core_exit(void)
 	destroy_workqueue(nvme_wq);
 }
 
-MODULE_LICENSE("GPL");
-MODULE_VERSION("1.0");
+
 module_init(nvme_core_init);
 module_exit(nvme_core_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_VERSION("1.0");

@@ -3282,6 +3282,50 @@ int f2fs_inplace_write_data(struct f2fs_io_info *fio)
 	return err;
 }
 
+/* RMW offload for non-page-aligned writes */
+int f2fs_rmw_offload_write_data(struct f2fs_io_info *fio)
+{
+	struct f2fs_sb_info *sbi = fio->sbi;
+	struct page *page = fio->page;
+	struct inode *inode = page->mapping->host;
+	struct bio *bio;
+	u64 byte_offset;
+	u32 byte_len;
+	int err = 0;
+
+	/* Only for data writes with RMW_OFFLOAD enabled */
+	if (!test_opt(sbi, RMW_OFFLOAD) || fio->type != DATA)
+		return -EOPNOTSUPP;
+
+	/* Calculate byte offset within the namespace */
+	byte_offset = (fio->new_blkaddr << 9);
+	byte_len = PAGE_SIZE;
+
+	/* Create a bio for the partial write command */
+	bio = bio_alloc(GFP_NOFS, 1);
+	if (!bio)
+		return -ENOMEM;
+
+	bio->bi_opf = REQ_OP_WRITE;
+	bio->bi_iter.bi_sector = byte_offset >> 9;
+	bio_set_dev(bio, inode->i_sb->s_bdev);
+
+	/* Add page to bio */
+	if (bio_add_page(bio, page, PAGE_SIZE, 0) != PAGE_SIZE) {
+		bio_put(bio);
+		return -ENOMEM;
+	}
+
+	/* Mark this as RMW offload request by setting a special flag */
+	bio->bi_opf |= (1 << 16);  /* Custom flag for RMW offload */
+	submit_bio(bio);
+
+	update_device_state(fio);
+	f2fs_update_iostat(sbi, fio->io_type, F2FS_BLKSIZE);
+
+	return err;
+}
+
 static inline int __f2fs_get_curseg(struct f2fs_sb_info *sbi,
 						unsigned int segno)
 {

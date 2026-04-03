@@ -141,6 +141,8 @@ enum {
 	Opt_checkpoint_disable_cap,
 	Opt_checkpoint_disable_cap_perc,
 	Opt_checkpoint_enable,
+	Opt_rmw_offload,
+	Opt_norms_offload,
 	Opt_err,
 };
 
@@ -203,6 +205,8 @@ static match_table_t f2fs_tokens = {
 	{Opt_checkpoint_disable_cap, "checkpoint=disable:%u"},
 	{Opt_checkpoint_disable_cap_perc, "checkpoint=disable:%u%%"},
 	{Opt_checkpoint_enable, "checkpoint=enable"},
+	{Opt_rmw_offload, "rmw_offload"},
+	{Opt_norms_offload, "norms_offload"},
 	{Opt_err, NULL},
 };
 
@@ -820,6 +824,14 @@ static int parse_options(struct super_block *sb, char *options)
 			break;
 		case Opt_checkpoint_enable:
 			clear_opt(sbi, DISABLE_CHECKPOINT);
+			break;
+		case Opt_rmw_offload:
+			set_opt(sbi, RMW_OFFLOAD);
+			pr_info("[F2FS-RMW] RMW offload to FEMU enabled\n");
+			break;
+		case Opt_norms_offload:
+			clear_opt(sbi, RMW_OFFLOAD);
+			pr_info("[F2FS-RMW] RMW offload to FEMU disabled\n");
 			break;
 		default:
 			f2fs_err(sbi, "Unrecognized mount option \"%s\" or missing value",

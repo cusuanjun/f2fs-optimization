@@ -24,7 +24,14 @@
 #include "node.h"
 #include "segment.h"
 #include "trace.h"
+#include <linux/nvme_pw.h>
 #include <trace/events/f2fs.h>
+
+
+
+static atomic64_t rmw_chk_hit = ATOMIC64_INIT(0);
+static atomic64_t rmw_offload_submit = ATOMIC64_INIT(0);
+static atomic64_t rmw_fallback = ATOMIC64_INIT(0);
 
 #define NUM_PREALLOC_POST_READ_CTXS	128
 
@@ -469,6 +476,78 @@ void f2fs_flush_merged_writes(struct f2fs_sb_info *sbi)
 }
 
 /*
+ * f2fs_try_offload_partial_write - attempt to offload a sub-page write to
+ * FEMU via the nvme_submit_partial_write() vendor command (opcode 0xC1).
+ *
+ * Called from f2fs_write_begin() when len < PAGE_SIZE, meaning the VFS is
+ * about to do a host-side RMW.  We intercept it here and push the raw
+ * partial data down to FEMU instead, which does the RMW internally.
+ *
+ * @inode:    the file inode
+ * @pos:      byte offset within the file
+ * @buf:      kernel address of the data to write (already copied from user)
+ * @len:      number of bytes to write (< PAGE_SIZE)
+ *
+ * Returns 0 on success (write offloaded), negative errno on failure,
+ * or -EOPNOTSUPP if offload is not applicable.
+ */
+ int f2fs_try_offload_partial_write(struct inode *inode, loff_t pos,
+	const void *buf, unsigned int len)
+{
+struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+struct block_device *bdev = inode->i_sb->s_bdev;
+struct dnode_of_data dn;
+struct page *ipage;
+block_t blkaddr;
+u64 byte_offset;
+int err;
+/* [TRACE-F2FS-OFFLOAD-1] ??????F2FS????????P??????? */
+pr_info("[F2FS-OFFLOAD-1] Detected unaligned write: ino=%lu pos=%lld len=%u\n",
+		inode->i_ino, (long long)pos, len);
+if (!test_opt(sbi, RMW_OFFLOAD))
+return -EOPNOTSUPP;
+if (f2fs_has_inline_data(inode))
+return -EOPNOTSUPP;
+ipage = f2fs_get_node_page(sbi, inode->i_ino);
+if (IS_ERR(ipage))
+return -EOPNOTSUPP;
+set_new_dnode(&dn, inode, ipage, ipage, 0);
+err = f2fs_get_dnode_of_data(&dn, pos >> PAGE_SHIFT, LOOKUP_NODE);
+if (err || dn.data_blkaddr == NULL_ADDR || dn.data_blkaddr == NEW_ADDR) {
+f2fs_put_dnode(&dn);
+return -EOPNOTSUPP;
+}
+blkaddr = dn.data_blkaddr;
+f2fs_put_dnode(&dn);
+byte_offset = ((u64)blkaddr << PAGE_SHIFT) + (pos & (PAGE_SIZE - 1));
+atomic64_inc(&rmw_offload_submit);
+/* [TRACE-F2FS-OFFLOAD-2] ??????F2FS?y?????????FEMU */
+pr_info("[F2FS-OFFLOAD-2] Offloading to FEMU: ino=%lu pos=%lld len=%u blkaddr=%u byte_off=%llu\n",
+		inode->i_ino, (long long)pos, len, blkaddr,
+		(unsigned long long)byte_offset);
+err = nvme_submit_partial_write(bdev, byte_offset, buf, len);
+if (err) {
+atomic64_inc(&rmw_fallback);
+/* [TRACE-F2FS-OFFLOAD-3] ????????????e?X?????????????RMW */
+pr_warn("[F2FS-OFFLOAD-3] Offload failed, fallback to host RMW: err=%d\n", err);
+return err;
+}
+/* [TRACE-F2FS-OFFLOAD-4] ?????????????????? */
+pr_info("[F2FS-OFFLOAD-4] Offload SUCCESS: ino=%lu pos=%lld len=%u\n",
+		inode->i_ino, (long long)pos, len);
+return 0;
+}
+
+/*
+ * Decide whether to offload RMW to FEMU (kept for compatibility)
+ */
+bool f2fs_should_offload_to_femu(unsigned int head_len, unsigned int body_len,
+				  unsigned int tail_len)
+{
+	return (head_len > 0 || tail_len > 0);
+}
+
+/*
  * Fill the locked page with data located in the block address.
  * A caller needs to unlock the page on failure.
  */
@@ -485,6 +564,9 @@ int f2fs_submit_page_bio(struct f2fs_io_info *fio)
 
 	trace_f2fs_submit_page_bio(page, fio);
 	f2fs_trace_ios(fio, 0);
+
+	pr_info("[F2FS-RMW] submit_page_bio blkaddr=%u op=%d ino=%u\n",
+		fio->new_blkaddr, fio->op, fio->ino);
 
 	/* Allocate a new bio */
 	bio = __bio_alloc(fio, 1);
@@ -596,6 +678,8 @@ static void f2fs_submit_ipu_bio(struct f2fs_sb_info *sbi, struct bio **bio,
 	__submit_bio(sbi, *bio, DATA);
 	*bio = NULL;
 }
+
+/* (placeholder removed - RMW offload now goes via f2fs_write_begin) */
 
 void f2fs_submit_page_write(struct f2fs_io_info *fio)
 {
@@ -2026,6 +2110,25 @@ got_it:
 		f2fs_put_dnode(&dn);
 		if (fio->need_lock == LOCK_REQ)
 			f2fs_unlock_op(fio->sbi);
+		
+		/* Try RMW offload if enabled */
+		if (test_opt(fio->sbi, RMW_OFFLOAD)) {
+			err = f2fs_rmw_offload_write_data(fio);
+			if (err != -EOPNOTSUPP) {
+				if (err) {
+					if (f2fs_encrypted_file(inode))
+						fscrypt_finalize_bounce_page(&fio->encrypted_page);
+					if (PageWriteback(page))
+						end_page_writeback(page);
+				} else {
+					set_inode_flag(inode, FI_UPDATE_WRITE);
+				}
+				trace_f2fs_do_write_data_page(fio->page, IPU);
+				return err;
+			}
+		}
+		
+		/* Fall back to regular inplace write */
 		err = f2fs_inplace_write_data(fio);
 		if (err) {
 			if (f2fs_encrypted_file(inode))
@@ -2143,6 +2246,74 @@ write:
 			(!wbc->for_reclaim &&
 			f2fs_available_free_memory(sbi, BASE_CHECK))))
 		goto redirty_out;
+
+	/*
+	 * RMW offload path: if write_begin tagged this page as a partial
+	 * write (PagePrivate + encoded offset/len in page->private), extract
+	 * the parameters and call nvme_submit_partial_write() directly.
+	 * This bypasses the host-side RMW entirely -- FEMU handles it.
+	 */
+	if (PagePrivate(page) && test_opt(sbi, RMW_OFFLOAD)
+	    && !S_ISDIR(inode->i_mode)) {
+		unsigned long pv = page_private(page);
+		unsigned int pg_off = (pv >> 16) & 0xFFFF;
+		unsigned int pw_len = pv & 0xFFFF;
+		if (pw_len > 0 && pw_len < PAGE_SIZE) {
+			struct block_device *bdev = inode->i_sb->s_bdev;
+			struct dnode_of_data dn;
+			block_t blk;
+			void *kaddr;
+			u64 byte_off;
+			int pw_err;
+
+			set_new_dnode(&dn, inode, NULL, NULL, 0);
+			pw_err = f2fs_get_dnode_of_data(&dn, page->index,
+							LOOKUP_NODE);
+			if (!pw_err && dn.data_blkaddr != NULL_ADDR
+			    && dn.data_blkaddr != NEW_ADDR) {
+				blk = dn.data_blkaddr;
+				byte_off = ((u64)blk << PAGE_SHIFT) + pg_off;
+				kaddr = kmap_atomic(page);
+				atomic64_inc(&rmw_offload_submit);
+				{
+					uint8_t *dbg = (uint8_t *)kaddr + pg_off;
+					pr_info("[F2FS-RMW-DBG] pg_off=%u pw_len=%u "
+						"PageUptodate=%d data[0]=0x%02x data[1]=0x%02x\n",
+						pg_off, pw_len, PageUptodate(page),
+						dbg[0], dbg[1]);
+				}
+				pr_info("[F2FS-RMW-OFFLOAD] writeback ino=%lu "
+					"blk=%u pg_off=%u len=%u "
+					"byte_off=%llu -- nvme_submit_partial_write\n",
+					inode->i_ino, blk, pg_off, pw_len,
+					(unsigned long long)byte_off);
+				pw_err = nvme_submit_partial_write(bdev,
+						byte_off,
+						(char *)kaddr + pg_off,
+						pw_len);
+				kunmap_atomic(kaddr);
+				f2fs_put_dnode(&dn);
+				if (!pw_err) {
+					pr_info("[F2FS-RMW-OFFLOAD] writeback SUCCESS\n");
+					/* Clear private tag and finish */
+					set_page_private(page, 0);
+					ClearPagePrivate(page);
+					inode_dec_dirty_pages(inode);
+					unlock_page(page);
+					return 0;
+				}
+				atomic64_inc(&rmw_fallback);
+				pr_warn("[F2FS-RMW-OFFLOAD] writeback FAILED "
+					"err=%d, falling back\n", pw_err);
+			} else {
+				f2fs_put_dnode(&dn);
+			}
+			/* Fall through to normal write path on error */
+			set_page_private(page, 0);
+			ClearPagePrivate(page);
+			SetPageUptodate(page);
+		}
+	}
 
 	/* Dentry blocks are controlled by checkpoint */
 	if (S_ISDIR(inode->i_mode)) {
@@ -2668,6 +2839,47 @@ repeat:
 
 	f2fs_wait_on_page_writeback(page, DATA, false, true);
 
+	/*
+	 * Sub-page write detected. If the mount option RMW_OFFLOAD is set
+	 * and there is an existing block on disk (blkaddr is valid, not NEW),
+	 * we skip the host-side read entirely: the page stays un-uptodate and
+	 * we tag it so that writeback will send only the partial data to FEMU
+	 * via nvme_submit_partial_write (opcode 0xC1).  FEMU does the RMW
+	 * internally in its DRAM cache.
+	 *
+	 * If RMW_OFFLOAD is not set, fall through to the normal path which
+	 * reads the old block into the page first (host-side RMW).
+	 */
+	pr_info("[F2FS-RMW-DBG] write_begin ino=%lu pos=%lld len=%u blkaddr=%u "
+		"rmw_opt=%d NEW=%u NULL=%u\n",
+		inode->i_ino, (long long)pos, len, blkaddr,
+		!!test_opt(sbi, RMW_OFFLOAD), NEW_ADDR, NULL_ADDR);
+	if (len < PAGE_SIZE && blkaddr != NEW_ADDR && blkaddr != NULL_ADDR
+	    && test_opt(sbi, RMW_OFFLOAD)) {
+		atomic64_inc(&rmw_chk_hit);
+		pr_info("[F2FS-RMW-OFFLOAD] write_begin INTERCEPT ino=%lu "
+			"pos=%lld len=%u blkaddr=%u -- skip host read\n",
+			inode->i_ino, (long long)pos, len, blkaddr);
+		/*
+		 * Store (intra-page-offset << 16 | len) in page->private so
+		 * that writeback can recover it.  We use the upper 16 bits for
+		 * the offset and the lower 16 bits for the length.
+		 */
+		if (!PagePrivate(page)) {
+			SetPagePrivate(page);
+			set_page_private(page,
+				(unsigned long)(((pos & (PAGE_SIZE - 1)) << 16)
+						| (len & 0xFFFF)));
+		}
+		/* Page stays !Uptodate intentionally: VFS will copy user data in */
+		return 0;
+	}
+
+	if (len < PAGE_SIZE && !PageUptodate(page))
+		pr_info("[F2FS-RMW] write_begin host-RMW ino=%lu pos=%llu "
+			"len=%u blkaddr=%u\n",
+			inode->i_ino, (unsigned long long)pos, len, blkaddr);
+
 	if (len == PAGE_SIZE || PageUptodate(page))
 		return 0;
 
@@ -2718,6 +2930,18 @@ static int f2fs_write_end(struct file *file,
 	struct inode *inode = page->mapping->host;
 
 	trace_f2fs_write_end(inode, pos, len, copied);
+
+	/* Debug: check page content after VFS copy */
+	if (PagePrivate(page) && len < PAGE_SIZE) {
+		void *kaddr = kmap_atomic(page);
+		unsigned int pg_off = (unsigned int)((pos) & (PAGE_SIZE - 1));
+		uint8_t *dbg = (uint8_t *)kaddr + pg_off;
+		pr_info("[F2FS-RMW-DBG] write_end pos=%lld len=%u copied=%u "
+			"PageUptodate=%d pg_off=%u data[0]=0x%02x data[1]=0x%02x\n",
+			(long long)pos, len, copied, PageUptodate(page),
+			pg_off, dbg[0], dbg[1]);
+		kunmap_atomic(kaddr);
+	}
 
 	/*
 	 * This should be come from len == PAGE_SIZE, and we expect copied
@@ -2811,6 +3035,79 @@ out:
 	bio_endio(bio);
 }
 
+/*
+ * f2fs_partial_write_offload - offload a non-block-aligned write to FEMU.
+ *
+ * Called when check_direct_IO() returns > 0 (write is misaligned).
+ * Sends NVMe vendor command 0xC1 (WRITE_PARTIAL) to FEMU:
+ *   cdw10/cdw11: 64-bit byte offset within the namespace
+ *   cdw12:       byte length of partial data
+ *   prp1/prp2:   DMA pointer to the data buffer
+ *
+ * FEMU performs in-place RMW on its DRAM backend.
+ */
+ssize_t f2fs_partial_write_offload(struct inode *inode,
+				   struct iov_iter *iter,
+				   loff_t offset)
+{
+	struct super_block *sb = inode->i_sb;
+	struct block_device *bdev = sb->s_bdev;
+	size_t count = iov_iter_count(iter);
+	uint64_t byte_offset;
+	sector_t phys_blk;
+	unsigned int blkbits = inode->i_blkbits;
+	unsigned int blksize = 1u << blkbits;
+	unsigned int blk_off = (unsigned int)(offset & (blksize - 1));
+	sector_t iblock = (sector_t)(offset >> blkbits);
+	struct buffer_head map_bh = { .b_size = blksize };
+	u8 *bounce;
+	int ret;
+
+	/*
+	 * Use DIO-write mapping to get the block that this write path actually
+	 * lands on. bmap() may return an old mapping that can be replaced by
+	 * out-of-place updates, causing offload writes to stale location.
+	 */
+	ret = get_data_block_dio_write(inode, iblock, &map_bh, 1);
+	if (ret || !buffer_mapped(&map_bh)) {
+		pr_err("f2fs_pw: map failed for offset=%lld iblock=%llu ret=%d mapped=%d\n",
+		       offset, (unsigned long long)iblock, ret,
+		       buffer_mapped(&map_bh));
+		return ret ? ret : -EIO;
+	}
+	phys_blk = map_bh.b_blocknr;
+
+	/*
+	 * F2FS data block address is in filesystem block units (4KiB here),
+	 * so convert using inode block size instead of 512-byte sectors.
+	 */
+	byte_offset = ((uint64_t)phys_blk << blkbits) + blk_off;
+
+	pr_info("[F2FS-RMW] offload offset=%lld len=%zu iblock=%llu phys_blk=%llu byte_offset=%llu\n",
+		offset, count, (unsigned long long)iblock,
+		(unsigned long long)phys_blk, byte_offset);
+
+	bounce = kvmalloc(count, GFP_KERNEL);
+	if (!bounce)
+		return -ENOMEM;
+
+	if (copy_from_iter(bounce, count, iter) != count) {
+		kvfree(bounce);
+		return -EFAULT;
+	}
+
+	ret = nvme_submit_partial_write(bdev, byte_offset, bounce, (u32)count);
+	kvfree(bounce);
+
+	if (ret) {
+		pr_err("[F2FS-RMW] nvme_submit_partial_write failed: %d\n", ret);
+		return ret;
+	}
+
+	f2fs_update_iostat(F2FS_I_SB(inode), APP_DIRECT_IO, count);
+	pr_info("[F2FS-RMW] offload ok offset=%lld len=%zu\n", offset, count);
+	return (ssize_t)count;
+}
 static ssize_t f2fs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 {
 	struct address_space *mapping = iocb->ki_filp->f_mapping;
@@ -2826,8 +3123,14 @@ static ssize_t f2fs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 	bool do_opu;
 
 	err = check_direct_IO(inode, iter, offset);
-	if (err)
-		return err < 0 ? err : 0;
+	if (err < 0)
+		return err;
+	if (err > 0) {
+		/* ????????????? FEMU ?????? RMW */
+		if (rw == WRITE)
+			return f2fs_partial_write_offload(inode, iter, offset);
+		return 0;
+	}
 
 	if (f2fs_force_buffered_io(inode, iocb, iter))
 		return 0;

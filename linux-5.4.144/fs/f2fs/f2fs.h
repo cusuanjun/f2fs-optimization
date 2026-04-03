@@ -101,6 +101,7 @@ extern const char *f2fs_fault_name[FAULT_MAX];
 #define F2FS_MOUNT_RESERVE_ROOT		0x01000000
 #define F2FS_MOUNT_DISABLE_CHECKPOINT	0x02000000
 #define F2FS_MOUNT_NORECOVERY		0x04000000
+#define F2FS_MOUNT_RMW_OFFLOAD		0x08000000
 
 #define F2FS_OPTION(sbi)	((sbi)->mount_opt)
 #define clear_opt(sbi, option)	(F2FS_OPTION(sbi).opt &= ~F2FS_MOUNT_##option)
@@ -1052,6 +1053,23 @@ enum iostat_type {
 	NR_IO_TYPE,
 };
 
+/* Non-page-aligned write control structure */
+struct f2fs_unaligned_write {
+	struct bio *parent_bio;		/* original bio */
+	sector_t page_start;		/* page-aligned start sector */
+	unsigned int head_len;		/* head non-aligned length */
+	unsigned int body_len;		/* middle page-aligned length */
+	unsigned int tail_len;		/* tail non-aligned length */
+	void *head_buf;			/* head data buffer */
+	void *tail_buf;			/* tail data buffer */
+	bool offload_to_femu;		/* offload to FEMU */
+};
+
+/* IO flags for non-aligned write */
+#define REQ_UNALIGNED_HEAD	0x10000000  /* head non-aligned */
+#define REQ_UNALIGNED_TAIL	0x20000000  /* tail non-aligned */
+#define REQ_OFFLOAD_RMW		0x40000000  /* request FEMU RMW */
+
 struct f2fs_io_info {
 	struct f2fs_sb_info *sbi;	/* f2fs_sb_info pointer */
 	nid_t ino;		/* inode number */
@@ -1074,6 +1092,7 @@ struct f2fs_io_info {
 	struct bio **bio;		/* bio for ipu */
 	sector_t *last_block;		/* last block number in bio */
 	unsigned char version;		/* version of the node */
+	struct f2fs_unaligned_write *unaligned;	/* non-aligned write info */
 };
 
 #define is_read_io(rw) ((rw) == READ)
@@ -3122,6 +3141,7 @@ void f2fs_do_write_node_page(unsigned int nid, struct f2fs_io_info *fio);
 void f2fs_outplace_write_data(struct dnode_of_data *dn,
 			struct f2fs_io_info *fio);
 int f2fs_inplace_write_data(struct f2fs_io_info *fio);
+int f2fs_rmw_offload_write_data(struct f2fs_io_info *fio);
 void f2fs_do_replace_block(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 			block_t old_blkaddr, block_t new_blkaddr,
 			bool recover_curseg, bool recover_newaddr);
@@ -3203,6 +3223,11 @@ void f2fs_flush_merged_writes(struct f2fs_sb_info *sbi);
 int f2fs_submit_page_bio(struct f2fs_io_info *fio);
 int f2fs_merge_page_bio(struct f2fs_io_info *fio);
 void f2fs_submit_page_write(struct f2fs_io_info *fio);
+bool f2fs_check_unaligned_write(struct f2fs_io_info *fio);
+int f2fs_split_unaligned_write(struct f2fs_io_info *fio, struct bio **bio_array);
+bool f2fs_should_offload_to_femu(unsigned int head_len, unsigned int body_len, unsigned int tail_len);
+int f2fs_try_offload_partial_write(struct inode *inode, loff_t pos,
+				   const void *buf, unsigned int len);
 struct block_device *f2fs_target_device(struct f2fs_sb_info *sbi,
 			block_t blk_addr, struct bio *bio);
 int f2fs_target_device_index(struct f2fs_sb_info *sbi, block_t blkaddr);
@@ -3760,5 +3785,10 @@ static inline bool is_journalled_quota(struct f2fs_sb_info *sbi)
 
 #define EFSBADCRC	EBADMSG		/* Bad CRC detected */
 #define EFSCORRUPTED	EUCLEAN		/* Filesystem is corrupted */
+
+/* Partial write offload to FEMU (defined in data.c) */
+ssize_t f2fs_partial_write_offload(struct inode *inode,
+				   struct iov_iter *iter,
+				   loff_t offset);
 
 #endif /* _LINUX_F2FS_H */

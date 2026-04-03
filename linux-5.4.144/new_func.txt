@@ -1,0 +1,77 @@
+/*
+ * f2fs_partial_write_offload - offload a non-block-aligned write to FEMU.
+ *
+ * Sends vendor NVMe command 0xC1 (NVME_CMD_WRITE_PARTIAL) to FEMU so the
+ * controller performs Read-Modify-Write internally, instead of the host.
+ *
+ * cdw10 = low32(ns_byte_offset)  cdw11 = high32(ns_byte_offset)
+ * cdw12 = byte_length            buffer = partial payload
+ */
+ssize_t f2fs_partial_write_offload(struct inode *inode,
+				   struct iov_iter *iter,
+				   loff_t offset)
+{
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	struct block_device *bdev = inode->i_sb->s_bdev;
+	size_t count = iov_iter_count(iter);
+	sector_t file_blk = (sector_t)(offset >> F2FS_BLKSIZE_BITS);
+	u32 intra_blk = (u32)(offset & (F2FS_BLKSIZE - 1));
+	sector_t phys_blk;
+	u64 ns_byte_off;
+	void *kbuf;
+	struct nvme_command cmd;
+	int ret;
+
+	/* bmap(): translate file logical block -> NVMe namespace physical block */
+	phys_blk = bmap(inode, file_blk);
+	if (phys_blk == 0)
+		return 0; /* block not allocated yet; caller uses buffered I/O */
+
+	/* Byte offset in the NVMe namespace (F2FS uses 4 KiB blocks) */
+	ns_byte_off = ((u64)phys_blk << F2FS_BLKSIZE_BITS) + intra_blk;
+
+	kbuf = kmalloc(count, GFP_KERNEL);
+	if (!kbuf)
+		return -ENOMEM;
+
+	if (copy_from_iter(kbuf, count, iter) != count) {
+		kfree(kbuf);
+		return -EFAULT;
+	}
+
+	/* Fill vendor NVMe command 0xC1 */
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.common.opcode = 0xC1;
+	cmd.common.nsid   = cpu_to_le32(1);
+	cmd.common.cdw10  = cpu_to_le32((u32)(ns_byte_off & 0xFFFFFFFFULL));
+	cmd.common.cdw11  = cpu_to_le32((u32)(ns_byte_off >> 32));
+	cmd.common.cdw12  = cpu_to_le32((u32)count);
+
+	pr_info("f2fs_pw: FEMU RMW phys_blk=%llu off=%llu len=%zu\n",
+		(u64)phys_blk, ns_byte_off, count);
+
+	ret = nvme_submit_sync_cmd(bdev_get_queue(bdev), &cmd,
+				   kbuf, (unsigned int)count);
+	kfree(kbuf);
+
+	if (ret) {
+		pr_err("f2fs_pw: FEMU RMW failed off=%llu len=%zu ret=%d\n",
+		       ns_byte_off, count, ret);
+		return -EIO;
+	}
+
+	if (offset + (loff_t)count > i_size_read(inode)) {
+		i_size_write(inode, offset + count);
+		mark_inode_dirty(inode);
+	}
+
+	invalidate_inode_pages2_range(inode->i_mapping,
+				      offset >> PAGE_SHIFT,
+				      (offset + count - 1) >> PAGE_SHIFT);
+
+	f2fs_update_iostat(sbi, APP_DIRECT_IO, count);
+
+	pr_info("f2fs_pw: FEMU RMW ok offset=%lld len=%zu\n", offset, count);
+
+	return (ssize_t)count;
+}

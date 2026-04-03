@@ -1,0 +1,2 @@
+#include <linux/nvme.h>
+extern int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd, void *buffer, unsigned bufflen);

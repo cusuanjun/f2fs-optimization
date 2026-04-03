@@ -567,7 +567,12 @@ enum nvme_opcode {
 	nvme_cmd_resv_report	= 0x0e,
 	nvme_cmd_resv_acquire	= 0x11,
 	nvme_cmd_resv_release	= 0x15,
+	/* Vendor-specific: partial write, RMW offloaded to FEMU (opcode 0xC1) */
+	nvme_cmd_write_partial	= 0xC1,
 };
+
+/* Alias used by nvme_pw.h and core.c */
+#define NVME_CMD_WRITE_PARTIAL	nvme_cmd_write_partial
 
 #define nvme_opcode_name(opcode)	{ opcode, #opcode }
 #define show_nvm_opcode_name(val)				\
